@@ -32,24 +32,25 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog"
 	"reflect"
-	"time"
 )
 
 type ControllerServer struct {
-	driver    *driver.DiskDriver
-	cloud     cloud.CloudManager
-	locks     *common.ResourceLocks
-	retryTime wait.Backoff
+	driver        *driver.DiskDriver
+	cloud         cloud.CloudManager
+	locks         *common.ResourceLocks
+	retryTime     wait.Backoff
+	detachLimiter common.RetryLimiter
 }
 
 // NewControllerServer
 // Create controller server
-func NewControllerServer(d *driver.DiskDriver, c cloud.CloudManager, rt wait.Backoff) *ControllerServer {
+func NewControllerServer(d *driver.DiskDriver, c cloud.CloudManager, rt wait.Backoff, maxRetry int) *ControllerServer {
 	return &ControllerServer{
-		driver:    d,
-		cloud:     c,
-		locks:     common.NewResourceLocks(),
-		retryTime: rt,
+		driver:        d,
+		cloud:         c,
+		locks:         common.NewResourceLocks(),
+		retryTime:     rt,
+		detachLimiter: common.NewRetryLimiter(maxRetry),
 	}
 }
 
@@ -83,6 +84,12 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.InvalidArgument, "volume name missing in request")
 	}
 	volName := req.GetName()
+	// ensure one call in-flight
+	klog.Infof("%s: Try to lock resource %s", hash, volName)
+	if acquired := cs.locks.TryAcquire(volName); !acquired {
+		return nil, status.Errorf(codes.Aborted, common.OperationPendingFmt, volName)
+	}
+	defer cs.locks.Release(volName)
 	// Pick one topology
 	var top *driver.Topology
 	if req.GetAccessibilityRequirements() != nil && cs.driver.ValidatePluginCapabilityService(csi.
@@ -124,12 +131,12 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	if exVol != nil {
 		klog.Infof("%s: Request volume name: %s, request size %d bytes, type: %d, zone: %s", hash, volName,
-			requiredSizeByte, sc.DiskType, top.GetZone())
+			requiredSizeByte, sc.GetDiskType().Int(), top.GetZone())
 		klog.Infof("%s: Exist volume name: %s, id: %s, capacity: %d bytes, type: %d, zone: %s",
 			hash, *exVol.VolumeName, *exVol.VolumeID, common.GibToByte(*exVol.Size), *exVol.VolumeType, top.GetZone())
 		exVolSizeByte := common.GibToByte(*exVol.Size)
 		if common.IsValidCapacityBytes(exVolSizeByte, req.GetCapacityRange()) &&
-			*exVol.VolumeType == sc.DiskType.Int() &&
+			*exVol.VolumeType == sc.GetDiskType().Int() &&
 			cs.IsValidTopology(exVol, req.GetAccessibilityRequirements()) {
 			// existing volume is compatible with new request and should be reused.
 			klog.Infof("Volume %s already exists and compatible with %s", volName, *exVol.VolumeID)
@@ -155,7 +162,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		requiredSizeGib := common.ByteCeilToGib(requiredSizeByte)
 		klog.Infof("%s: Creating empty volume %s with %d Gib in zone %s...", hash, volName, requiredSizeGib,
 			top.GetZone())
-		newVolId, err := cs.cloud.CreateVolume(volName, requiredSizeGib, sc.Replica, sc.DiskType.Int(), top.GetZone())
+		newVolId, err := cs.cloud.CreateVolume(volName, requiredSizeGib, sc.GetReplica(), sc.GetDiskType().Int(), top.GetZone())
 		if err != nil {
 			klog.Errorf("%s: Failed to create volume %s, error: %v", hash, volName, err)
 			return nil, status.Error(codes.Internal, err.Error())
@@ -475,33 +482,39 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 	}
 
 	// When return with retry message at describe volume, retry after several seconds.
-	// Retry times is 3.
-	// Retry interval is changed from 1 second to 3 seconds.
-	for i := 1; i <= 3; i++ {
+
+	err = retry.OnError(DefaultBackOff, cloud.IsCannotFindDevicePath, func() error {
 		volInfo, err := cs.cloud.FindVolume(volumeId)
 		if err != nil {
-			return nil, status.Error(codes.Internal, err.Error())
+			return err
 		}
 		// check device path
 		if *volInfo.Instance.Device != "" {
 			// found device path
 			klog.Infof("%s: Attaching volume %s on instance %s succeed.", hash, volumeId, nodeId)
-			return &csi.ControllerPublishVolumeResponse{}, nil
+			return nil
 		} else {
 			// cannot found device path
 			klog.Infof("%s: Cannot find device path and retry to find volume device %s", hash, volumeId)
-			time.Sleep(time.Duration(i) * time.Second)
+			return cloud.NewCannotFindDevicePathError(volumeId, nodeId, *volInfo.ZoneID)
 		}
-	}
-	// Cannot find device path
-	// Try to detach volume
-	klog.Infof("%s: Cannot find device path and going to detach volume %s", hash, volumeId)
-	if err := cs.cloud.DetachVolume(volumeId, nodeId); err != nil {
-		return nil, status.Errorf(codes.Internal, "cannot find device path, detach volume %s failed", volumeId)
+	})
+
+	if err != nil {
+		// Cannot find device path
+		// Try to detach volume
+		klog.Errorf("%s: Failed to find device path, error: %s", hash, err.Error())
+		klog.Infof("%s: Going to detach volume %s", hash, volumeId)
+		if err := cs.cloud.DetachVolume(volumeId, nodeId); err != nil {
+			return nil, status.Errorf(codes.Internal, "cannot find device path, detach volume %s failed", volumeId)
+		} else {
+			return nil, status.Errorf(codes.Internal,
+				"cannot find device path, volume %s has been detached, CSI framework will try to attach instance %s again.",
+				volumeId, nodeId)
+		}
 	} else {
-		return nil, status.Errorf(codes.Internal,
-			"cannot find device path, volume %s has been detached, please try attaching to instance %s again.",
-			volumeId, nodeId)
+		// Succeed to find device path
+		return &csi.ControllerPublishVolumeResponse{}, nil
 	}
 }
 
@@ -558,12 +571,17 @@ func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 	}
 
 	// do detach
+	klog.Infof("Volume id %s retry times is %d", volumeId, cs.detachLimiter.GetCurrentRetryTimes(volumeId))
+	if cs.detachLimiter.Try(volumeId) == false {
+		return nil, status.Errorf(codes.Internal, "volume %s exceeds max retry times %d.", volumeId, cs.detachLimiter.GetMaxRetryTimes())
+	}
 	klog.Infof("Detaching volume %s to instance %s in zone %s...", volumeId, nodeId, cs.cloud.GetZone())
 	err = cs.cloud.DetachVolume(volumeId, nodeId)
 	if err != nil {
-		klog.Errorf("Failed to detach disk image: %s from instance %s with error: %v",
-			volumeId, nodeId, err)
-		return nil, err
+		klog.Errorf("Failed to detach disk image: %s from instance %s with error: %s",
+			volumeId, nodeId, err.Error())
+		cs.detachLimiter.Add(volumeId)
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
@@ -650,12 +668,6 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 		return nil, status.Errorf(codes.NotFound, "Volume: %s does not exist", volumeId)
 	}
 
-	// volume in use
-	if *volInfo.Status == cloud.DiskStatusInuse {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"volume %s currently published on a node but plugin only support OFFLINE expansion", volumeId)
-	}
-
 	// 2. Get capacity
 	volType := driver.VolumeType(*volInfo.VolumeType)
 	if !volType.IsValid() {
@@ -667,6 +679,21 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 	requiredSizeBytes, err := sc.GetRequiredVolumeSizeByte(req.GetCapacityRange())
 	if err != nil {
 		return nil, status.Errorf(codes.OutOfRange, err.Error())
+	}
+	// For idempotent
+	volSizeBytes := common.GibToByte(*volInfo.Size)
+	if volSizeBytes >= requiredSizeBytes {
+		klog.Infof("%s: Volume %s size %d >= request expand size %d", hash, volumeId, volSizeBytes, requiredSizeBytes)
+		return &csi.ControllerExpandVolumeResponse{
+			CapacityBytes:         volSizeBytes,
+			NodeExpansionRequired: true,
+		}, nil
+	}
+
+	// volume in use
+	if *volInfo.Status == cloud.DiskStatusInuse {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"volume %s currently published on a node but plugin only support OFFLINE expansion", volumeId)
 	}
 
 	// 3. Retry to expand volume

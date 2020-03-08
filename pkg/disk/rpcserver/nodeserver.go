@@ -103,7 +103,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	fsType := qc.FsType
+	fsType := qc.GetFsType()
 
 	// Check volume exist
 	volInfo, err := ns.cloud.FindVolume(volumeId)
@@ -124,13 +124,14 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	// check targetPath is mounted
-	mounter := mount.New("")
-	notMnt, err := mounter.IsNotMountPoint(targetPath)
+	notMnt, err := ns.mounter.IsNotMountPoint(targetPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			klog.Infof("Cannot find target path %s and create it.", targetPath)
 			if err = os.MkdirAll(targetPath, 0750); err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
 			}
+			klog.Infof("Succeed to create target path %s", targetPath)
 			notMnt = true
 		} else {
 			return nil, status.Error(codes.Internal, err.Error())
@@ -149,7 +150,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		options = append(options, "ro")
 	}
 	klog.Infof("Bind mount %s at %s, fsType %s, options %v ...", stagePath, targetPath, fsType, options)
-	if err := mounter.Mount(stagePath, targetPath, fsType, options); err != nil {
+	if err := ns.mounter.Mount(stagePath, targetPath, fsType, options); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	klog.Infof("Mount bind %s at %s succeed", stagePath, targetPath)
@@ -191,20 +192,9 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	}
 
 	// 1. Unmount
-	// check targetPath is mounted
-	mounter := mount.New("")
-	notMnt, err := mounter.IsNotMountPoint(targetPath)
+	err = mount.CleanupMountPoint(targetPath, ns.mounter.Interface, true)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	if notMnt {
-		klog.Warningf("Volume %s has not mount point", volumeId)
-		return &csi.NodeUnpublishVolumeResponse{}, nil
-	}
-	// do unmount
-	klog.Infof("Unbind mount volume %s/%s", targetPath, volumeId)
-	if err = mounter.Unmount(targetPath); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Errorf(codes.Internal, "Unmount target path %s error: %v", targetPath, err)
 	}
 	klog.Infof("Unbound mount volume succeed")
 
@@ -249,7 +239,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	fsType := qc.FsType
+	fsType := qc.GetFsType()
 
 	// Check volume exist
 	volInfo, err := ns.cloud.FindVolume(volumeId)
@@ -287,8 +277,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 	// do mount
 	klog.Infof("Mounting %s to %s format %s...", volumeId, targetPath, fsType)
-	diskMounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: mount.NewOsExec()}
-	if err := diskMounter.FormatAndMount(devicePath, targetPath, fsType, []string{}); err != nil {
+	if err := ns.mounter.FormatAndMount(devicePath, targetPath, fsType, []string{}); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	klog.Infof("Mount %s to %s succeed", volumeId, targetPath)
@@ -338,8 +327,7 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	// For idempotent:
 	// If the volume corresponding to the volume id is not staged to the staging target path,
 	// the plugin MUST reply 0 OK.
-	mounter := mount.New("")
-	notMnt, err := mounter.IsLikelyNotMountPoint(targetPath)
+	notMnt, err := ns.mounter.IsLikelyNotMountPoint(targetPath)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -347,12 +335,12 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 	// count mount point
-	_, cnt, err := mount.GetDeviceNameFromMount(mounter, targetPath)
+	_, cnt, err := mount.GetDeviceNameFromMount(ns.mounter, targetPath)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	// do unmount
-	err = mounter.Unmount(targetPath)
+	err = ns.mounter.Unmount(targetPath)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -522,7 +510,6 @@ func (ns *NodeServer) NodeGetVolumeStats(ctx context.Context,
 
 	// Checkout device
 	klog.Infof("%s: Get device name from mount point %s", hash, volumePath)
-	volume.NewMetricsDu(volumePath)
 	devicePath, _, err := mount.GetDeviceNameFromMount(ns.mounter, volumePath)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "cannot get device name from mount point %s", volumePath)

@@ -17,7 +17,7 @@
 .PHONY: all disk
 
 DISK_IMAGE_NAME=csiplugin/csi-qingcloud
-DISK_VERSION=v1.1.0-rc.1
+DISK_VERSION=v1.1.0
 ROOT_PATH=$(pwd)
 PACKAGE_LIST=./cmd/... ./pkg/...
 
@@ -27,19 +27,15 @@ disk: mod
 disk-container:
 	docker build -t ${DISK_IMAGE_NAME}:${DISK_VERSION} -f deploy/disk/docker/Dockerfile  .
 
-install-dev:
-	cp /root/.qingcloud/config.yaml deploy/disk/kubernetes/base/config.yaml
-	kustomize build  deploy/disk/kubernetes/overlays/dev|kubectl apply -f -
+yaml:
+	kustomize build deploy/disk/kubernetes/overlays/patch > deploy/disk/kubernetes/releases/qingcloud-csi-disk-${DISK_VERSION}.yaml
 
-uninstall-dev:
-	kustomize build  deploy/disk/kubernetes/overlays/dev|kubectl delete -f -
+install:
+	cp /${HOME}/.qingcloud/config.yaml deploy/disk/kubernetes/base/config.yaml
+	kustomize build deploy/disk/kubernetes/overlays/patch|kubectl apply -f -
 
-gen-dev:
-	cp /root/.qingcloud/config.yaml deploy/disk/kubernetes/base/config.yaml
-	kustomize build deploy/disk/kubernetes/overlays/dev
-
-gen-prod:
-	kustomize build deploy/disk/kubernetes/overlays/prod > deploy/disk/kubernetes/releases/qingcloud-csi-disk-${DISK_VERSION}.yaml
+uninstall:
+	kustomize build deploy/disk/kubernetes/overlays/patch|kubectl delete -f -
 
 mod:
 	go build ./...

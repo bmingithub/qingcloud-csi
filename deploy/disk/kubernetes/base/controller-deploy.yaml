@@ -30,14 +30,14 @@ spec:
       serviceAccount: csi-qingcloud-controller
       containers:
       - name: csi-provisioner
-        image: quay.io/k8scsi/csi-provisioner:v1.4.0-rc1
+        image: quay.io/k8scsi/csi-provisioner:v1.4.0
         resources:
           limits:
-            memory: "20Mi"
-            cpu: "20m"
+            memory: "80Mi"
+            cpu: "80m"
           requests:
-            memory: "20Mi"
-            cpu: "20m"
+            memory: "80Mi"
+            cpu: "80m"
         args:
         - "--csi-address=$(ADDRESS)"
         - "--enable-leader-election"
@@ -60,11 +60,11 @@ spec:
         image: quay.io/k8scsi/csi-attacher:v2.0.0
         resources:
           limits:
-            memory: "20Mi"
-            cpu: "20m"
+            memory: "80Mi"
+            cpu: "80m"
           requests:
-            memory: "20Mi"
-            cpu: "20m"
+            memory: "80Mi"
+            cpu: "80m"
         args:
         - "--csi-address=$(ADDRESS)"
         - "--leader-election"
@@ -85,7 +85,7 @@ spec:
         - name: socket-dir
           mountPath: /csi
       - name: csi-snapshotter
-        image: quay.io/k8scsi/csi-snapshotter:v1.2.1
+        image: quay.io/k8scsi/csi-snapshotter:v1.2.2
         resources:
           limits:
             memory: "20Mi"

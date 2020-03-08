@@ -12,14 +12,22 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-kind: Kustomization
-namespace: kube-system
-images:
-  - name: csiplugin/csi-qingcloud
-    newTag: v1.1.0-rc.1
-commonLabels:
-  tier: prod
-patchesStrategicMerge:
-  - node-ds.yaml
-resources:
-  - ../../base
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: csi-qingcloud-node
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: csi-qingcloud
+          imagePullPolicy: "IfNotPresent"
+          volumeMounts:
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: "Bidirectional"
+      volumes:
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
